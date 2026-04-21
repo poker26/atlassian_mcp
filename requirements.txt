@@ -1,0 +1,22 @@
+# MCP
+mcp[cli]>=1.2.0
+fastmcp>=0.3.0
+
+# Web framework (FastMCP use Starlette; FastAPI для REST mirror)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Atlassian API
+atlassian-python-api>=3.41.0
+
+# Content conversion
+markdown>=3.5
+beautifulsoup4>=4.12.0
+
+# Config & logging
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv>=1.0.0
+
+# HTTP / SSL
+requests>=2.31.0

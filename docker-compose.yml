@@ -1,0 +1,14 @@
+services:
+  atlassian-mcp:
+    build: .
+    container_name: atlassian-mcp
+    restart: unless-stopped
+    env_file: .env
+    network_mode: host
+    volumes:
+      - /etc/resolv.conf:/etc/resolv.conf:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
