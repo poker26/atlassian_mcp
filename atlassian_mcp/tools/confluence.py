@@ -586,6 +586,91 @@ def confluence_add_label(page_id: str, label: str) -> dict:
     }
 
 
+
+# --------- users ---------
+
+def confluence_get_current_user() -> dict:
+    """Return the currently authenticated Confluence user (i.e. the owner of CONFLUENCE_PAT).
+
+    Essential for tasks like adding yourself to a signature list (<ri:user ri:userkey="..."/>)
+    or knowing your own userKey to filter watchers/mentions.
+
+    Returns {userKey, username, displayName, email, type, profilePicture}.
+    """
+    data = safe_call(
+        confluence.get,
+        "rest/api/user/current",
+    )
+    return {
+        "userKey": data.get("userKey"),
+        "username": data.get("username"),
+        "displayName": data.get("displayName"),
+        "email": data.get("email"),
+        "type": data.get("type"),
+        "profilePicture": (data.get("profilePicture") or {}).get("path"),
+    }
+
+
+def confluence_get_user(identifier: str, by: str = "username") -> dict:
+    """Get a Confluence user profile by username or userKey.
+
+    Args:
+        identifier: the username (e.g. 'oleg.pokrovskiy') or userKey (hex id).
+        by: 'username' or 'key'. Default 'username'.
+
+    Returns {userKey, username, displayName, email, type, profilePicture}.
+    """
+    if by not in ("username", "key"):
+        raise ToolError("by must be 'username' or 'key'")
+
+    param_name = "username" if by == "username" else "key"
+    data = safe_call(
+        confluence.get,
+        "rest/api/user",
+        params={param_name: identifier},
+    )
+    return {
+        "userKey": data.get("userKey"),
+        "username": data.get("username"),
+        "displayName": data.get("displayName"),
+        "email": data.get("email"),
+        "type": data.get("type"),
+        "profilePicture": (data.get("profilePicture") or {}).get("path"),
+    }
+
+
+def confluence_search_users(query: str, limit: int = 25) -> list[dict]:
+    """Search Confluence users by displayName or username fragment via CQL.
+
+    Args:
+        query: search string (fragment of displayName or username).
+        limit: max results (default 25, up to 50).
+
+    Returns list of {userKey, username, displayName, email}.
+    """
+    # Confluence DC: CQL "user.fullname" matches displayName; wrap query with wildcards.
+    cql = f'type = "user" AND user.fullname ~ "{query}"'
+    raw = safe_call(
+        confluence.get,
+        "rest/api/search",
+        params={
+            "cql": cql,
+            "limit": min(limit, 50),
+        },
+    )
+    results = raw.get("results", []) if isinstance(raw, dict) else []
+    out = []
+    for r in results:
+        u = r.get("user") or {}
+        out.append({
+            "userKey": u.get("userKey"),
+            "username": u.get("username"),
+            "displayName": u.get("displayName"),
+            "email": u.get("email"),
+        })
+    return out
+
+
 TOOLS = [
     confluence_list_spaces,
     confluence_get_page,
@@ -602,4 +687,7 @@ TOOLS = [
     confluence_get_attachment,
     confluence_upload_attachment,
     confluence_add_label,
+    confluence_get_current_user,
+    confluence_get_user,
+    confluence_search_users,
 ]

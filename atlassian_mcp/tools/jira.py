@@ -262,6 +262,60 @@ def jira_transition_issue(
         "transition_used": {"id": target.get("id"), "name": target.get("name")},
     }
 
+
+# --------- users ---------
+
+def jira_get_current_user() -> dict:
+    """Return the currently authenticated Jira user (i.e. the owner of JIRA_PAT).
+
+    Useful when a tool needs to know "who am I" — e.g. to fill `assignee=self`,
+    or to look up the user key for attribution.
+
+    Returns {name, key, email, displayName, active, timeZone}.
+    """
+    data = safe_call(jira.myself)
+    return {
+        "name": data.get("name"),
+        "key": data.get("key"),
+        "email": data.get("emailAddress"),
+        "displayName": data.get("displayName"),
+        "active": data.get("active"),
+        "timeZone": data.get("timeZone"),
+    }
+
+
+def jira_search_users(query: str, max_results: int = 25, include_inactive: bool = False) -> list[dict]:
+    """Search Jira users by username, email, or displayName fragment.
+
+    Args:
+        query: search string (matches username, name, email prefix).
+        max_results: cap on results (default 25, up to 50).
+        include_inactive: include disabled users (default False).
+
+    Returns list of {name, key, email, displayName, active}.
+    """
+    raw = safe_call(
+        jira.get,
+        "rest/api/2/user/search",
+        params={
+            "username": query,
+            "maxResults": min(max_results, 50),
+            "includeInactive": str(include_inactive).lower(),
+        },
+    )
+    users = raw if isinstance(raw, list) else (raw.get("users", []) if isinstance(raw, dict) else [])
+    return [
+        {
+            "name": u.get("name"),
+            "key": u.get("key"),
+            "email": u.get("emailAddress"),
+            "displayName": u.get("displayName"),
+            "active": u.get("active"),
+        }
+        for u in users
+    ]
+
+
 TOOLS = [
     jira_search,
     jira_get_issue,
@@ -269,4 +323,6 @@ TOOLS = [
     jira_update_issue,
     jira_add_comment,
     jira_transition_issue,
+    jira_get_current_user,
+    jira_search_users,
 ]

@@ -16,7 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from atlassian_mcp.auth import require_api_key
 from atlassian_mcp.tools.common import ToolError
 from atlassian_mcp.tools.confluence import (
+    confluence_get_current_user,
     confluence_get_page,
+    confluence_get_user,
     confluence_get_page_children,
     confluence_get_page_comments,
     confluence_get_page_history,
@@ -24,8 +26,14 @@ from atlassian_mcp.tools.confluence import (
     confluence_list_spaces,
     confluence_search_by_title,
     confluence_search_cql,
+    confluence_search_users,
 )
-from atlassian_mcp.tools.jira import jira_get_issue, jira_search
+from atlassian_mcp.tools.jira import (
+    jira_get_current_user,
+    jira_get_issue,
+    jira_search,
+    jira_search_users,
+)
 
 
 def _handle(fn, *args, **kwargs):
@@ -153,7 +161,8 @@ def rest_confluence_search_cql(
     cql: str = Query(..., description="Confluence Query Language expression"),
     limit: int = Query(25, ge=1, le=50),
 ):
-    return _handle(confluence_search_cql, cql=cql, limit=limit)
+    return _handle(confluence_search_cql,
+    confluence_search_users, cql=cql, limit=limit)
 
 
 @router.get(
@@ -172,3 +181,44 @@ def rest_confluence_search_by_title(
         title=title,
         limit=limit,
     )
+
+# --------- Users ---------
+
+@router.get("/jira/me", tags=["jira"], summary="Current Jira user")
+def rest_jira_me():
+    return _handle(jira_get_current_user)
+
+
+@router.get("/jira/users", tags=["jira"], summary="Search Jira users")
+def rest_jira_search_users(
+    query: str = Query(..., description="Username/email/displayName fragment"),
+    max_results: int = Query(25, ge=1, le=50),
+    include_inactive: bool = Query(False),
+):
+    return _handle(
+        jira_search_users,
+        query=query,
+        max_results=max_results,
+        include_inactive=include_inactive,
+    )
+
+
+@router.get("/confluence/me", tags=["confluence"], summary="Current Confluence user")
+def rest_confluence_me():
+    return _handle(confluence_get_current_user)
+
+
+@router.get("/confluence/users/{identifier}", tags=["confluence"], summary="Get Confluence user by username or key")
+def rest_confluence_get_user(
+    identifier: str,
+    by: str = Query("username", pattern="^(username|key)$"),
+):
+    return _handle(confluence_get_user, identifier=identifier, by=by)
+
+
+@router.get("/confluence/users", tags=["confluence"], summary="Search Confluence users")
+def rest_confluence_search_users(
+    query: str = Query(..., description="Displayname/username fragment"),
+    limit: int = Query(25, ge=1, le=50),
+):
+    return _handle(confluence_search_users, query=query, limit=limit)
