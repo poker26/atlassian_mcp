@@ -3,51 +3,46 @@ from __future__ import annotations
 
 from typing import Any
 
+import requests
+
 from atlassian_mcp.clients import jira
-from atlassian_mcp.tools.common import ToolError, safe_call
+from atlassian_mcp.config import settings
+from atlassian_mcp.tools.common import (
+    ToolError,
+    b64decode_to_bytes,
+    b64encode_bytes,
+    safe_call,
+)
+from atlassian_mcp.tools.url_fetch import fetch_url
 
 
-# ----- read -----
-
-def jira_search(jql: str, max_results: int = 25, fields: str | None = None) -> list[dict]:
-    """Search Jira issues by JQL.
-
-    Args:
-        jql: JQL query (e.g. `project = FF AND status = "In Progress"`).
-        max_results: number of issues to return (default 25, up to 100).
-        fields: comma-separated field list. Defaults to summary,status,assignee,priority,updated.
-
-    Returns a list of dicts with key, summary, status, assignee, priority, updated, url.
-    """
-    fields_str = fields or "summary,status,assignee,priority,updated"
-    result = safe_call(jira.jql, jql, limit=min(max_results, 100), fields=fields_str)
-    issues = result.get("issues", []) if isinstance(result, dict) else []
-
-    out = []
-    for i in issues:
-        f = i.get("fields", {}) or {}
-        key = i.get("key")
-        out.append({
-            "key": key,
-            "summary": f.get("summary", ""),
-            "status": (f.get("status") or {}).get("name", "Unknown"),
-            "assignee": (f.get("assignee") or {}).get("displayName", "Unassigned"),
-            "priority": (f.get("priority") or {}).get("name"),
-            "updated": (f.get("updated") or "")[:19],
-            "url": f"{jira.url.rstrip('/')}/browse/{key}" if key else None,
-        })
-    return out
+def _base() -> str:
+    return jira.url.rstrip("/")
 
 
-def jira_get_issue(issue_key: str) -> dict:
-    """Full details of a Jira issue: status, description, assignee, comments, attachments, labels.
+def _browse(key: str) -> str:
+    return f"{_base()}/browse/{key}"
 
-    Args:
-        issue_key: issue key like 'FF-560' or 'PP-240'.
-    """
-    data = safe_call(jira.issue, issue_key, expand="renderedFields")
+
+# --------- issue shapes ---------
+
+def _issue_digest(i: dict) -> dict:
+    """Flat compact representation suitable for digests / lists."""
+    f = i.get("fields", {}) or {}
+    key = i.get("key")
+    return {
+        "key": key,
+        "summary": f.get("summary", ""),
+        "status": (f.get("status") or {}).get("name", "Unknown"),
+        "assignee": (f.get("assignee") or {}).get("displayName", "Unassigned"),
+        "priority": (f.get("priority") or {}).get("name"),
+        "updated": (f.get("updated") or "")[:19],
+        "url": _browse(key) if key else None,
+    }
+
+
+def _issue_full(data: dict, key: str) -> dict:
     f = data.get("fields", {}) or {}
-
     attachments = [
         {
             "id": a.get("id"),
@@ -68,10 +63,9 @@ def jira_get_issue(issue_key: str) -> dict:
         }
         for c in ((f.get("comment") or {}).get("comments") or [])
     ]
-
     return {
-        "key": issue_key,
-        "url": f"{jira.url.rstrip('/')}/browse/{issue_key}",
+        "key": key,
+        "url": _browse(key),
         "summary": f.get("summary", ""),
         "description": f.get("description", ""),
         "status": (f.get("status") or {}).get("name", "Unknown"),
@@ -86,6 +80,180 @@ def jira_get_issue(issue_key: str) -> dict:
         "attachments": attachments,
         "comments": comments,
     }
+
+
+# ----- read -----
+
+def jira_search(
+    jql: str,
+    max_results: int = 25,
+    fields: str | None = None,
+    start_at: int = 0,
+    preset: str = "digest",
+) -> dict:
+    """Search Jira issues by JQL with pagination.
+
+    Args:
+        jql: JQL query.
+        max_results: page size (default 25, up to 100).
+        fields: comma-separated field list. Defaults depend on preset.
+        start_at: pagination offset. Use next_start_at from a prior call.
+        preset: 'digest' (flat compact issues) or 'full' (same shape as
+                jira_get_issue for each item). Default 'digest'.
+
+    Returns:
+        {
+          "issues": [...],
+          "pagination": {"start_at", "max_results", "total", "is_last",
+                         "next_start_at" (None if is_last)}
+        }
+    """
+    if preset not in ("digest", "full"):
+        raise ToolError("preset must be 'digest' or 'full'")
+
+    if fields is None:
+        fields = (
+            "summary,status,assignee,priority,updated"
+            if preset == "digest"
+            else "*all"
+        )
+
+    limit = min(max_results, 100)
+    raw = safe_call(
+        jira.jql,
+        jql,
+        fields=fields,
+        start=start_at,
+        limit=limit,
+    )
+    issues_raw = raw.get("issues", []) if isinstance(raw, dict) else []
+    total = raw.get("total", len(issues_raw)) if isinstance(raw, dict) else len(issues_raw)
+
+    if preset == "digest":
+        issues = [_issue_digest(i) for i in issues_raw]
+    else:
+        issues = [_issue_full(i, i.get("key")) for i in issues_raw]
+
+    returned = len(issues_raw)
+    is_last = (start_at + returned) >= total
+    return {
+        "issues": issues,
+        "pagination": {
+            "start_at": start_at,
+            "max_results": limit,
+            "total": total,
+            "is_last": is_last,
+            "next_start_at": None if is_last else start_at + returned,
+        },
+    }
+
+
+def jira_get_issue(issue_key: str) -> dict:
+    """Full details of a Jira issue: status, description, assignee, comments, attachments, labels.
+
+    Args:
+        issue_key: issue key like 'FF-560' or 'PP-240'.
+    """
+    data = safe_call(jira.issue, issue_key, expand="renderedFields")
+    return _issue_full(data, issue_key)
+
+
+def jira_get_transitions(issue_key: str) -> list[dict]:
+    """List available workflow transitions for an issue from its current status.
+
+    Pair this with jira_transition_issue — use the id or name returned here.
+
+    Args:
+        issue_key: issue key like 'FF-560'.
+
+    Returns list of {id, name, to_status}.
+    """
+    raw = safe_call(jira.get_issue_transitions, issue_key) or []
+    if isinstance(raw, dict):
+        raw = raw.get("transitions", [])
+
+    def _to_name(entry: dict) -> str:
+        to = entry.get("to")
+        if isinstance(to, dict):
+            return to.get("name") or ""
+        if isinstance(to, str):
+            return to
+        return ""
+
+    return [
+        {
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "to_status": _to_name(t),
+        }
+        for t in raw
+    ]
+
+
+def jira_get_changelog(
+    issue_key: str,
+    since: str | None = None,
+    until: str | None = None,
+    fields: list[str] | None = None,
+) -> list[dict]:
+    """Get changelog (status/assignee/priority/... transitions) for a Jira issue.
+
+    On Jira DC, changelog is fetched via GET /rest/api/2/issue/{key}?expand=changelog,
+    which returns up to ~100 history entries in a single response. For typical
+    issues this is enough; very long histories may be truncated by the server.
+
+    Args:
+        issue_key: issue key.
+        since: ISO timestamp (e.g. '2026-04-22T00:00:00Z'); only entries with
+               `created >= since` are returned. Compared as strings, so both
+               bounds should be in the same timezone (UTC recommended).
+        until: ISO timestamp; only entries with `created < until` are returned.
+        fields: restrict to items that changed specific fields (e.g. ['status',
+               'assignee']). If None, all field changes are returned.
+
+    Returns list of {id, created, author, items: [{field, from, fromString,
+                                                   to, toString}]}
+    ordered oldest -> newest.
+    """
+    data = safe_call(jira.issue, issue_key, expand="changelog")
+    changelog = (data.get("changelog") or {})
+    histories = changelog.get("histories") or []
+
+    field_set = {f.lower() for f in fields} if fields else None
+
+    out: list[dict] = []
+    for h in histories:
+        created = h.get("created", "")
+        if since and created < since:
+            continue
+        if until and created >= until:
+            continue
+
+        items = h.get("items") or []
+        if field_set is not None:
+            items = [it for it in items if (it.get("field") or "").lower() in field_set]
+            if not items:
+                continue
+
+        author = h.get("author") or {}
+        out.append({
+            "id": h.get("id"),
+            "created": created,
+            "author": author.get("displayName") or author.get("name"),
+            "items": [
+                {
+                    "field": it.get("field"),
+                    "from": it.get("from"),
+                    "fromString": it.get("fromString"),
+                    "to": it.get("to"),
+                    "toString": it.get("toString"),
+                }
+                for it in items
+            ],
+        })
+
+    out.sort(key=lambda e: e.get("created") or "")
+    return out
 
 
 # ----- write -----
@@ -129,11 +297,7 @@ def jira_create_issue(
     key = result.get("key")
     if not key:
         raise ToolError(f"Unexpected Jira response: {result}")
-    return {
-        "key": key,
-        "url": f"{jira.url.rstrip('/')}/browse/{key}",
-        "summary": summary,
-    }
+    return {"key": key, "url": _browse(key), "summary": summary}
 
 
 def jira_update_issue(
@@ -148,12 +312,6 @@ def jira_update_issue(
 
     Only non-None arguments are sent. Labels fully replace the existing list.
     Use jira_transition_issue to change status (status is not a field update).
-
-    Args:
-        issue_key: issue key like 'FF-560'.
-        summary, description, priority, assignee, labels: optional fields to update.
-
-    Returns {key, updated_fields}.
     """
     fields: dict[str, Any] = {}
     if summary is not None:
@@ -173,7 +331,7 @@ def jira_update_issue(
     safe_call(jira.update_issue_field, issue_key, fields)
     return {
         "key": issue_key,
-        "url": f"{jira.url.rstrip('/')}/browse/{issue_key}",
+        "url": _browse(issue_key),
         "updated_fields": list(fields.keys()),
     }
 
@@ -206,26 +364,16 @@ def jira_transition_issue(
     Args:
         issue_key: issue key like 'FF-560'.
         transition: transition name (case-insensitive) or numeric id.
-                    Pass an unknown value to get the list of available transitions.
+                    Use jira_get_transitions to discover available options.
         comment: optional comment to add during transition.
 
-    Returns {key, new_status, transition_used} on success, or {error, available_transitions} if not found.
+    Returns {key, new_status, transition_used} on success, or
+            {error, available_transitions} if not found.
     """
-    available = safe_call(jira.get_issue_transitions, issue_key) or []
-    if isinstance(available, dict):
-        available = available.get("transitions", [])
+    available = jira_get_transitions(issue_key)
 
-    def _to_name(entry: dict) -> str:
-        """'to' may be a string or a {name: ...} dict depending on API version."""
-        to = entry.get("to")
-        if isinstance(to, dict):
-            return to.get("name") or ""
-        if isinstance(to, str):
-            return to
-        return ""
-
-    target = None
     needle = str(transition).strip().lower()
+    target = None
     for t in available:
         if str(t.get("id")) == needle:
             target = t
@@ -233,17 +381,14 @@ def jira_transition_issue(
         if (t.get("name") or "").lower() == needle:
             target = t
             break
-        if _to_name(t).lower() == needle:
+        if (t.get("to_status") or "").lower() == needle:
             target = t
             break
 
     if not target:
         return {
             "error": f"Transition '{transition}' not found for {issue_key}",
-            "available_transitions": [
-                {"id": t.get("id"), "name": t.get("name"), "to": _to_name(t)}
-                for t in available
-            ],
+            "available_transitions": available,
         }
 
     safe_call(
@@ -257,19 +402,395 @@ def jira_transition_issue(
 
     return {
         "key": issue_key,
-        "url": f"{jira.url.rstrip('/')}/browse/{issue_key}",
-        "new_status": _to_name(target) or target.get("name"),
+        "url": _browse(issue_key),
+        "new_status": target.get("to_status") or target.get("name"),
         "transition_used": {"id": target.get("id"), "name": target.get("name")},
     }
+
+
+# --------- attachments ---------
+
+def jira_list_attachments(issue_key: str) -> list[dict]:
+    """List attachments on a Jira issue.
+
+    Args:
+        issue_key: issue key like 'FF-560'.
+
+    Returns list of {id, filename, size_bytes, mime, created, author, download_url}.
+    """
+    data = safe_call(jira.issue, issue_key, fields="attachment")
+    fields_ = data.get("fields", {}) or {}
+    atts = fields_.get("attachment") or []
+    out = []
+    for a in atts:
+        author = a.get("author") or {}
+        out.append({
+            "id": a.get("id"),
+            "filename": a.get("filename"),
+            "size_bytes": a.get("size"),
+            "mime": a.get("mimeType"),
+            "created": a.get("created"),
+            "author": author.get("displayName") or author.get("name"),
+            "download_url": a.get("content"),
+        })
+    return out
+
+
+def jira_get_attachment(attachment_id: str) -> dict:
+    """Download a Jira attachment as base64.
+
+    Size limited by MAX_ATTACHMENT_SIZE (default 2 MB). Larger attachments fail
+    with a clear error -- use the download_url from jira_list_attachments to
+    fetch them directly via HTTP.
+
+    Args:
+        attachment_id: attachment id.
+
+    Returns {id, filename, mime, size_bytes, data_base64}.
+    """
+    meta = safe_call(
+        jira.get,
+        f"rest/api/2/attachment/{attachment_id}",
+    )
+    content_url = meta.get("content")
+    if not content_url:
+        raise ToolError(f"No content URL for attachment {attachment_id}")
+
+    declared_size = meta.get("size") or 0
+    if declared_size and declared_size > settings.max_attachment_size:
+        raise ToolError(
+            f"Attachment too large ({declared_size} bytes > "
+            f"{settings.max_attachment_size}). "
+            f"Use download_url directly: {content_url}"
+        )
+
+    headers = {"Authorization": f"Bearer {settings.jira_pat}"}
+    with requests.get(
+        content_url,
+        headers=headers,
+        verify=settings.verify,
+        stream=True,
+        timeout=30,
+    ) as resp:
+        resp.raise_for_status()
+        data = bytearray()
+        for chunk in resp.iter_content(64 * 1024):
+            data.extend(chunk)
+            if len(data) > settings.max_attachment_size:
+                raise ToolError(
+                    f"Attachment exceeded {settings.max_attachment_size} bytes "
+                    f"while streaming. Use download_url directly: {content_url}"
+                )
+
+    return {
+        "id": attachment_id,
+        "filename": meta.get("filename"),
+        "mime": meta.get("mimeType"),
+        "size_bytes": len(data),
+        "data_base64": b64encode_bytes(bytes(data)),
+    }
+
+
+def _jira_upload_raw(
+    issue_key: str,
+    filename: str,
+    data: bytes,
+    mime: str | None,
+) -> list[dict]:
+    """Low-level multipart upload to Jira. Returns list of attachment dicts."""
+    url = f"{_base()}/rest/api/2/issue/{issue_key}/attachments"
+    headers = {
+        "Authorization": f"Bearer {settings.jira_pat}",
+        "X-Atlassian-Token": "no-check",
+    }
+    files = {
+        "file": (filename, data, mime or "application/octet-stream"),
+    }
+    resp = requests.post(
+        url,
+        headers=headers,
+        files=files,
+        verify=settings.verify,
+        timeout=60,
+    )
+    if not resp.ok:
+        raise ToolError(
+            f"Jira attachment upload failed: HTTP {resp.status_code} "
+            f"{resp.text[:500]}"
+        )
+    result = resp.json()
+    if not isinstance(result, list):
+        raise ToolError(f"Unexpected Jira attachment response: {result}")
+    return result
+
+
+def jira_upload_attachment(
+    issue_key: str,
+    filename: str,
+    data_base64: str,
+    mime: str | None = None,
+) -> dict:
+    """Upload an attachment to a Jira issue from base64.
+
+    Size limited by MAX_ATTACHMENT_SIZE (default 2 MB). For larger files use
+    jira_attach_from_url with a public download URL.
+
+    Args:
+        issue_key: issue key.
+        filename: attachment filename.
+        data_base64: file content, base64-encoded.
+        mime: optional MIME type. If omitted, Atlassian guesses from filename.
+
+    Returns {id, filename, size_bytes, mime, download_url}.
+    """
+    raw = b64decode_to_bytes(data_base64)
+    if len(raw) > settings.max_attachment_size:
+        raise ToolError(
+            f"Attachment too large ({len(raw)} bytes > "
+            f"{settings.max_attachment_size}). "
+            f"Use jira_attach_from_url instead."
+        )
+    results = _jira_upload_raw(issue_key, filename, raw, mime)
+    a = results[0]
+    return {
+        "id": a.get("id"),
+        "filename": a.get("filename") or filename,
+        "size_bytes": a.get("size"),
+        "mime": a.get("mimeType"),
+        "download_url": a.get("content"),
+    }
+
+
+def jira_attach_from_url(
+    issue_key: str,
+    url: str,
+    filename: str | None = None,
+    mime: str | None = None,
+) -> dict:
+    """Download a file from a public URL and attach it to a Jira issue.
+
+    URL validation: only http/https; private/reserved IPs rejected; redirects
+    capped at 5. Size capped by MAX_URL_FETCH_SIZE (default 10 MB).
+
+    Args:
+        issue_key: issue key.
+        url: public http(s) URL to fetch.
+        filename: override auto-detection (Content-Disposition -> URL path).
+        mime: override Content-Type from response.
+
+    Returns {id, filename, size_bytes, mime, download_url, source_url}.
+    """
+    fetched = fetch_url(url, filename=filename, mime=mime)
+    results = _jira_upload_raw(issue_key, fetched.filename, fetched.data, fetched.mime)
+    a = results[0]
+    return {
+        "id": a.get("id"),
+        "filename": a.get("filename") or fetched.filename,
+        "size_bytes": a.get("size") or len(fetched.data),
+        "mime": a.get("mimeType") or fetched.mime,
+        "download_url": a.get("content"),
+        "source_url": url,
+    }
+
+
+# --------- links ---------
+
+def jira_get_links(issue_key: str) -> list[dict]:
+    """Get issue links (blocks, relates, duplicates, ...) for a Jira issue.
+
+    Args:
+        issue_key: issue key.
+
+    Returns list of {id, type, direction, target_key, target_summary, target_status}.
+            direction is 'inward' or 'outward' relative to this issue.
+    """
+    data = safe_call(jira.issue, issue_key, fields="issuelinks")
+    links = ((data.get("fields") or {}).get("issuelinks") or [])
+    out = []
+    for l in links:
+        t = l.get("type") or {}
+        outward = l.get("outwardIssue")
+        inward = l.get("inwardIssue")
+        if outward:
+            target = outward
+            direction = "outward"
+            type_label = t.get("outward") or t.get("name")
+        elif inward:
+            target = inward
+            direction = "inward"
+            type_label = t.get("inward") or t.get("name")
+        else:
+            continue
+        tf = target.get("fields") or {}
+        out.append({
+            "id": l.get("id"),
+            "type": type_label,
+            "type_name": t.get("name"),
+            "direction": direction,
+            "target_key": target.get("key"),
+            "target_summary": tf.get("summary"),
+            "target_status": (tf.get("status") or {}).get("name"),
+            "target_url": _browse(target.get("key")) if target.get("key") else None,
+        })
+    return out
+
+
+def jira_add_link(
+    from_key: str,
+    to_key: str,
+    link_type: str = "Relates",
+) -> dict:
+    """Create an issue link between two Jira issues.
+
+    Args:
+        from_key: source issue key (the "outward" side).
+        to_key: target issue key (the "inward" side).
+        link_type: link type name ('Blocks', 'Relates', 'Duplicate',
+                   'Cloners', ...). Case-sensitive on some DC builds;
+                   use the exact name shown in Issue -> Link dialog.
+
+    Returns {from_key, to_key, link_type}.
+    """
+    payload = {
+        "type": {"name": link_type},
+        "inwardIssue": {"key": to_key},
+        "outwardIssue": {"key": from_key},
+    }
+    safe_call(
+        jira.post,
+        "rest/api/2/issueLink",
+        data=payload,
+    )
+    return {
+        "from_key": from_key,
+        "to_key": to_key,
+        "link_type": link_type,
+    }
+
+
+def jira_add_remote_link(
+    issue_key: str,
+    url: str,
+    title: str,
+    summary: str | None = None,
+    icon_url: str | None = None,
+) -> dict:
+    """Add a remote link (web URL) to a Jira issue.
+
+    Typical use: link a Jira issue to a GitLab MR, a Confluence page, or an
+    external doc. Unlike issue-to-issue links (jira_add_link), remote links
+    can point anywhere on the web.
+
+    Args:
+        issue_key: Jira issue key.
+        url: remote URL.
+        title: link title shown in Jira UI.
+        summary: optional longer description.
+        icon_url: optional favicon/icon URL.
+
+    Returns {issue_key, remote_link_id, url, title}.
+    """
+    object_ = {"url": url, "title": title}
+    if summary:
+        object_["summary"] = summary
+    if icon_url:
+        object_["icon"] = {"url16x16": icon_url, "title": title}
+
+    payload = {"object": object_}
+    result = safe_call(
+        jira.post,
+        f"rest/api/2/issue/{issue_key}/remotelink",
+        data=payload,
+    )
+    return {
+        "issue_key": issue_key,
+        "remote_link_id": result.get("id") if isinstance(result, dict) else None,
+        "url": url,
+        "title": title,
+    }
+
+
+# --------- project metadata helpers ---------
+
+def jira_list_labels(project_key: str | None = None) -> list[str]:
+    """List labels known to Jira. Optionally scope to a specific project.
+
+    Args:
+        project_key: if given, only labels used in issues of this project.
+
+    Returns sorted list of label names.
+    """
+    if project_key:
+        jql = f'project = "{project_key.upper()}" AND labels is not EMPTY'
+        raw = safe_call(jira.jql, jql, fields="labels", limit=100)
+        issues = raw.get("issues", []) if isinstance(raw, dict) else []
+        seen: set[str] = set()
+        for i in issues:
+            for lbl in ((i.get("fields") or {}).get("labels") or []):
+                seen.add(lbl)
+        return sorted(seen)
+
+    raw = safe_call(jira.get, "rest/api/2/label")
+    if isinstance(raw, dict) and "values" in raw:
+        return sorted(raw.get("values") or [])
+    return []
+
+
+def jira_list_components(project_key: str) -> list[dict]:
+    """List components for a Jira project.
+
+    Args:
+        project_key: project key.
+
+    Returns list of {id, name, description, lead}.
+    """
+    raw = safe_call(
+        jira.get,
+        f"rest/api/2/project/{project_key.upper()}/components",
+    )
+    comps = raw if isinstance(raw, list) else []
+    return [
+        {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "description": c.get("description"),
+            "lead": (c.get("lead") or {}).get("displayName")
+                    or (c.get("lead") or {}).get("name"),
+        }
+        for c in comps
+    ]
+
+
+def jira_list_versions(project_key: str) -> list[dict]:
+    """List fix versions / releases for a Jira project.
+
+    Args:
+        project_key: project key.
+
+    Returns list of {id, name, released, archived, release_date, start_date}.
+    """
+    raw = safe_call(
+        jira.get,
+        f"rest/api/2/project/{project_key.upper()}/versions",
+    )
+    versions = raw if isinstance(raw, list) else []
+    return [
+        {
+            "id": v.get("id"),
+            "name": v.get("name"),
+            "released": v.get("released"),
+            "archived": v.get("archived"),
+            "release_date": v.get("releaseDate"),
+            "start_date": v.get("startDate"),
+        }
+        for v in versions
+    ]
 
 
 # --------- users ---------
 
 def jira_get_current_user() -> dict:
     """Return the currently authenticated Jira user (i.e. the owner of JIRA_PAT).
-
-    Useful when a tool needs to know "who am I" — e.g. to fill `assignee=self`,
-    or to look up the user key for attribution.
 
     Returns {name, key, email, displayName, active, timeZone}.
     """
@@ -284,13 +805,12 @@ def jira_get_current_user() -> dict:
     }
 
 
-def jira_search_users(query: str, max_results: int = 25, include_inactive: bool = False) -> list[dict]:
+def jira_search_users(
+    query: str,
+    max_results: int = 25,
+    include_inactive: bool = False,
+) -> list[dict]:
     """Search Jira users by username, email, or displayName fragment.
-
-    Args:
-        query: search string (matches username, name, email prefix).
-        max_results: cap on results (default 25, up to 50).
-        include_inactive: include disabled users (default False).
 
     Returns list of {name, key, email, displayName, active}.
     """
@@ -303,7 +823,9 @@ def jira_search_users(query: str, max_results: int = 25, include_inactive: bool 
             "includeInactive": str(include_inactive).lower(),
         },
     )
-    users = raw if isinstance(raw, list) else (raw.get("users", []) if isinstance(raw, dict) else [])
+    users = raw if isinstance(raw, list) else (
+        raw.get("users", []) if isinstance(raw, dict) else []
+    )
     return [
         {
             "name": u.get("name"),
@@ -319,10 +841,22 @@ def jira_search_users(query: str, max_results: int = 25, include_inactive: bool 
 TOOLS = [
     jira_search,
     jira_get_issue,
+    jira_get_transitions,
+    jira_get_changelog,
     jira_create_issue,
     jira_update_issue,
     jira_add_comment,
     jira_transition_issue,
+    jira_list_attachments,
+    jira_get_attachment,
+    jira_upload_attachment,
+    jira_attach_from_url,
+    jira_get_links,
+    jira_add_link,
+    jira_add_remote_link,
+    jira_list_labels,
+    jira_list_components,
+    jira_list_versions,
     jira_get_current_user,
     jira_search_users,
 ]
