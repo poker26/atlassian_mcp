@@ -17,7 +17,6 @@ from atlassian_mcp.tools.confluence import (
     confluence_get_page_history,
     confluence_list_attachments,
     confluence_list_spaces,
-    confluence_search_by_date,
     confluence_search_by_title,
     confluence_search_cql,
     confluence_search_users,
@@ -38,6 +37,7 @@ from atlassian_mcp.tools.jira import (
 
 
 def _handle(fn, *args, **kwargs):
+    """Call a tool and convert ToolError into HTTP 502."""
     try:
         return fn(*args, **kwargs)
     except ToolError as e:
@@ -91,9 +91,9 @@ def rest_jira_get_transitions(issue_key: str):
 )
 def rest_jira_get_changelog(
     issue_key: str,
-    since: str | None = Query(None),
-    until: str | None = Query(None),
-    fields: str | None = Query(None),
+    since: str | None = Query(None, description="ISO timestamp lower bound"),
+    until: str | None = Query(None, description="ISO timestamp upper bound"),
+    fields: str | None = Query(None, description="Comma-separated fields filter"),
 ):
     field_list = [f.strip() for f in fields.split(",")] if fields else None
     return _handle(
@@ -146,7 +146,9 @@ def rest_jira_list_versions(project_key: str):
     tags=["jira"],
     summary="List labels (optionally scoped to project)",
 )
-def rest_jira_list_labels(project_key: str | None = Query(None)):
+def rest_jira_list_labels(
+    project_key: str | None = Query(None),
+):
     return _handle(jira_list_labels, project_key=project_key)
 
 
@@ -239,56 +241,13 @@ def rest_confluence_list_attachments(
 @router.get(
     "/confluence/search",
     tags=["confluence"],
-    summary="CQL search with pagination",
+    summary="CQL search",
 )
 def rest_confluence_search_cql(
-    cql: str = Query(..., description="CQL expression"),
+    cql: str = Query(..., description="Confluence Query Language expression"),
     limit: int = Query(25, ge=1, le=50),
-    start_at: int = Query(0, ge=0),
-    include_excerpt: bool = Query(True),
 ):
-    return _handle(
-        confluence_search_cql,
-        cql=cql,
-        limit=limit,
-        start_at=start_at,
-        include_excerpt=include_excerpt,
-    )
-
-
-@router.get(
-    "/confluence/activity",
-    tags=["confluence"],
-    summary="Find pages/blogs changed in a date range (TZ-aware)",
-)
-def rest_confluence_search_by_date(
-    date_from: str = Query(..., description="YYYY-MM-DD, inclusive lower bound"),
-    date_to: str | None = Query(None, description="YYYY-MM-DD, exclusive upper bound"),
-    timezone: str = Query("Europe/Moscow"),
-    field: str = Query("lastmodified", pattern="^(lastmodified|created)$"),
-    space_key: str | None = Query(None),
-    content_type: str = Query(
-        "page",
-        pattern="^(page|blogpost|comment|attachment)$",
-    ),
-    title_contains: str | None = Query(None),
-    include_excerpt: bool = Query(False),
-    max_results: int = Query(50, ge=1, le=50),
-    start_at: int = Query(0, ge=0),
-):
-    return _handle(
-        confluence_search_by_date,
-        date_from=date_from,
-        date_to=date_to,
-        timezone=timezone,
-        field=field,
-        space_key=space_key,
-        content_type=content_type,
-        title_contains=title_contains,
-        include_excerpt=include_excerpt,
-        max_results=max_results,
-        start_at=start_at,
-    )
+    return _handle(confluence_search_cql, cql=cql, limit=limit)
 
 
 @router.get(
@@ -318,7 +277,7 @@ def rest_jira_me():
 
 @router.get("/jira/users", tags=["jira"], summary="Search Jira users")
 def rest_jira_search_users(
-    query: str = Query(...),
+    query: str = Query(..., description="Username/email/displayName fragment"),
     max_results: int = Query(25, ge=1, le=50),
     include_inactive: bool = Query(False),
 ):
@@ -349,7 +308,7 @@ def rest_confluence_get_user(
 
 @router.get("/confluence/users", tags=["confluence"], summary="Search Confluence users")
 def rest_confluence_search_users(
-    query: str = Query(...),
+    query: str = Query(..., description="Displayname/username fragment"),
     limit: int = Query(25, ge=1, le=50),
 ):
     return _handle(confluence_search_users, query=query, limit=limit)

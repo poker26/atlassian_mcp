@@ -11,6 +11,7 @@ from atlassian_mcp.tools.common import (
     ToolError,
     b64decode_to_bytes,
     b64encode_bytes,
+    envelope_full,
     safe_call,
 )
 from atlassian_mcp.tools.url_fetch import fetch_url
@@ -195,7 +196,7 @@ def jira_get_changelog(
     since: str | None = None,
     until: str | None = None,
     fields: list[str] | None = None,
-) -> list[dict]:
+) -> dict:
     """Get changelog (status/assignee/priority/... transitions) for a Jira issue.
 
     On Jira DC, changelog is fetched via GET /rest/api/2/issue/{key}?expand=changelog,
@@ -253,7 +254,7 @@ def jira_get_changelog(
         })
 
     out.sort(key=lambda e: e.get("created") or "")
-    return out
+    return envelope_full(out)
 
 
 # ----- write -----
@@ -266,6 +267,7 @@ def jira_create_issue(
     priority: str | None = None,
     assignee: str | None = None,
     labels: list[str] | None = None,
+    custom_fields: dict | None = None,
 ) -> dict:
     """Create a new Jira issue.
 
@@ -277,6 +279,18 @@ def jira_create_issue(
         priority: priority name (e.g. 'High', 'Normal'). Omit to use project default.
         assignee: assignee username (not display name).
         labels: list of labels.
+        custom_fields: dict of custom field values, merged into the issue payload
+                       as-is. Keys MUST be the customfield_XXXXX IDs (use
+                       jira_list_fields or jira_get_create_meta to discover them).
+                       Values must be in the exact shape Jira expects for that
+                       field type — see jira_get_create_meta for allowedValues
+                       and schema. Examples:
+                         {"customfield_10101": {"id": "10500"}}      # single-select
+                         {"customfield_10102": [{"id": "10501"}]}    # multi-select
+                         {"customfield_10103": "free text"}          # text
+                         {"customfield_10104": {"name": "username"}} # user picker
+                       Standard fields (summary, description, etc.) cannot be
+                       set through this dict — use the dedicated arguments.
 
     Returns {key, url, summary}.
     """
@@ -293,6 +307,24 @@ def jira_create_issue(
     if labels:
         fields["labels"] = list(labels)
 
+    if custom_fields:
+        # Sanity check — only customfield_* keys, and don't let custom_fields
+        # silently override the standard fields above (would be confusing).
+        reserved = {"project", "summary", "description", "issuetype",
+                    "priority", "assignee", "labels"}
+        for cf_key, cf_value in custom_fields.items():
+            if cf_key in reserved:
+                raise ToolError(
+                    f"custom_fields cannot set standard field '{cf_key}'. "
+                    f"Use the dedicated argument instead."
+                )
+            if not cf_key.startswith("customfield_"):
+                raise ToolError(
+                    f"custom_fields keys must start with 'customfield_', "
+                    f"got '{cf_key}'. Use jira_list_fields to find the right ID."
+                )
+            fields[cf_key] = cf_value
+
     result = safe_call(jira.create_issue, fields=fields)
     key = result.get("key")
     if not key:
@@ -307,11 +339,19 @@ def jira_update_issue(
     priority: str | None = None,
     assignee: str | None = None,
     labels: list[str] | None = None,
+    custom_fields: dict | None = None,
 ) -> dict:
     """Update one or more fields of an existing Jira issue.
 
     Only non-None arguments are sent. Labels fully replace the existing list.
     Use jira_transition_issue to change status (status is not a field update).
+
+    Args:
+        custom_fields: dict of custom field values, merged into the update
+                       payload. Keys MUST be customfield_XXXXX IDs. Values must
+                       be in the exact shape Jira expects (see jira_create_issue
+                       docstring for examples). Pass None as a value to clear
+                       a field, e.g. {"customfield_10101": None}.
     """
     fields: dict[str, Any] = {}
     if summary is not None:
@@ -324,6 +364,21 @@ def jira_update_issue(
         fields["assignee"] = {"name": assignee}
     if labels is not None:
         fields["labels"] = list(labels)
+
+    if custom_fields:
+        reserved = {"summary", "description", "priority", "assignee", "labels"}
+        for cf_key, cf_value in custom_fields.items():
+            if cf_key in reserved:
+                raise ToolError(
+                    f"custom_fields cannot set standard field '{cf_key}'. "
+                    f"Use the dedicated argument instead."
+                )
+            if not cf_key.startswith("customfield_"):
+                raise ToolError(
+                    f"custom_fields keys must start with 'customfield_', "
+                    f"got '{cf_key}'. Use jira_list_fields to find the right ID."
+                )
+            fields[cf_key] = cf_value
 
     if not fields:
         raise ToolError("No fields provided to update")
@@ -410,13 +465,13 @@ def jira_transition_issue(
 
 # --------- attachments ---------
 
-def jira_list_attachments(issue_key: str) -> list[dict]:
+def jira_list_attachments(issue_key: str) -> dict:
     """List attachments on a Jira issue.
 
     Args:
         issue_key: issue key like 'FF-560'.
 
-    Returns list of {id, filename, size_bytes, mime, created, author, download_url}.
+    Returns {results: [{id, filename, size_bytes, mime, created, author, download_url}], pagination}.
     """
     data = safe_call(jira.issue, issue_key, fields="attachment")
     fields_ = data.get("fields", {}) or {}
@@ -433,7 +488,7 @@ def jira_list_attachments(issue_key: str) -> list[dict]:
             "author": author.get("displayName") or author.get("name"),
             "download_url": a.get("content"),
         })
-    return out
+    return envelope_full(out)
 
 
 def jira_get_attachment(attachment_id: str) -> dict:
@@ -595,13 +650,13 @@ def jira_attach_from_url(
 
 # --------- links ---------
 
-def jira_get_links(issue_key: str) -> list[dict]:
+def jira_get_links(issue_key: str) -> dict:
     """Get issue links (blocks, relates, duplicates, ...) for a Jira issue.
 
     Args:
         issue_key: issue key.
 
-    Returns list of {id, type, direction, target_key, target_summary, target_status}.
+    Returns {results: [{id, type, direction, target_key, target_summary, target_status}], pagination}.
             direction is 'inward' or 'outward' relative to this issue.
     """
     data = safe_call(jira.issue, issue_key, fields="issuelinks")
@@ -632,7 +687,7 @@ def jira_get_links(issue_key: str) -> list[dict]:
             "target_status": (tf.get("status") or {}).get("name"),
             "target_url": _browse(target.get("key")) if target.get("key") else None,
         })
-    return out
+    return envelope_full(out)
 
 
 def jira_add_link(
@@ -712,7 +767,7 @@ def jira_add_remote_link(
 
 # --------- project metadata helpers ---------
 
-def jira_list_labels(project_key: str | None = None) -> list[str]:
+def jira_list_labels(project_key: str | None = None) -> dict:
     """List labels known to Jira. Optionally scope to a specific project.
 
     Args:
@@ -728,15 +783,15 @@ def jira_list_labels(project_key: str | None = None) -> list[str]:
         for i in issues:
             for lbl in ((i.get("fields") or {}).get("labels") or []):
                 seen.add(lbl)
-        return sorted(seen)
+        return envelope_full(sorted(seen))
 
     raw = safe_call(jira.get, "rest/api/2/label")
     if isinstance(raw, dict) and "values" in raw:
-        return sorted(raw.get("values") or [])
-    return []
+        return envelope_full(sorted(raw.get("values") or []))
+    return envelope_full([])
 
 
-def jira_list_components(project_key: str) -> list[dict]:
+def jira_list_components(project_key: str) -> dict:
     """List components for a Jira project.
 
     Args:
@@ -749,7 +804,7 @@ def jira_list_components(project_key: str) -> list[dict]:
         f"rest/api/2/project/{project_key.upper()}/components",
     )
     comps = raw if isinstance(raw, list) else []
-    return [
+    return envelope_full([
         {
             "id": c.get("id"),
             "name": c.get("name"),
@@ -758,10 +813,10 @@ def jira_list_components(project_key: str) -> list[dict]:
                     or (c.get("lead") or {}).get("name"),
         }
         for c in comps
-    ]
+    ])
 
 
-def jira_list_versions(project_key: str) -> list[dict]:
+def jira_list_versions(project_key: str) -> dict:
     """List fix versions / releases for a Jira project.
 
     Args:
@@ -774,7 +829,7 @@ def jira_list_versions(project_key: str) -> list[dict]:
         f"rest/api/2/project/{project_key.upper()}/versions",
     )
     versions = raw if isinstance(raw, list) else []
-    return [
+    return envelope_full([
         {
             "id": v.get("id"),
             "name": v.get("name"),
@@ -784,7 +839,7 @@ def jira_list_versions(project_key: str) -> list[dict]:
             "start_date": v.get("startDate"),
         }
         for v in versions
-    ]
+    ])
 
 
 # --------- users ---------
@@ -809,7 +864,7 @@ def jira_search_users(
     query: str,
     max_results: int = 25,
     include_inactive: bool = False,
-) -> list[dict]:
+) -> dict:
     """Search Jira users by username, email, or displayName fragment.
 
     Returns list of {name, key, email, displayName, active}.
@@ -826,7 +881,7 @@ def jira_search_users(
     users = raw if isinstance(raw, list) else (
         raw.get("users", []) if isinstance(raw, dict) else []
     )
-    return [
+    return envelope_full([
         {
             "name": u.get("name"),
             "key": u.get("key"),
@@ -835,7 +890,7 @@ def jira_search_users(
             "active": u.get("active"),
         }
         for u in users
-    ]
+    ])
 
 
 TOOLS = [

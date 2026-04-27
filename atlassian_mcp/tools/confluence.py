@@ -1,7 +1,9 @@
 """Confluence tools (REST API v1 via atlassian-python-api, Confluence 7.19 DC)."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -11,7 +13,11 @@ from atlassian_mcp.tools.common import (
     ToolError,
     b64decode_to_bytes,
     b64encode_bytes,
+    envelope_full,
+    envelope_paginated,
     safe_call,
+    sanitize_str,
+    sanitize_strings,
     to_storage,
 )
 from atlassian_mcp.tools.url_fetch import fetch_url
@@ -23,30 +29,32 @@ def _base() -> str:
 
 # --------- read ---------
 
-def confluence_list_spaces(limit: int = 25, start: int = 0) -> list[dict]:
+def confluence_list_spaces(limit: int = 25, start_at: int = 0) -> dict:
     """List Confluence spaces visible to the authenticated user.
 
-    Returns list of {key, name, type, url}.
+    Returns {results: [{key, name, type, url}], pagination}.
     """
-    raw = safe_call(confluence.get_all_spaces, start=start, limit=min(limit, 100))
+    page_limit = min(limit, 100)
+    raw = safe_call(confluence.get_all_spaces, start=start_at, limit=page_limit)
     results = raw.get("results", []) if isinstance(raw, dict) else (raw or [])
     base = _base()
-    return [
+    items = [
         {
             "key": s.get("key"),
-            "name": s.get("name"),
+            "name": sanitize_str(s.get("name")),
             "type": s.get("type"),
             "url": f"{base}/display/{s.get('key')}" if s.get("key") else None,
         }
         for s in results
     ]
+    return envelope_paginated(items, start_at=start_at, limit=page_limit)
 
 
 def confluence_get_page(page_id: str, include_body: bool = True) -> dict:
     """Get a Confluence page by id: title, space, version, body (storage format), URL."""
     expand = "space,version,body.storage" if include_body else "space,version"
     page = safe_call(confluence.get_page_by_id, page_id, expand=expand)
-    return {
+    result = {
         "id": page.get("id"),
         "title": page.get("title"),
         "space_key": (page.get("space") or {}).get("key"),
@@ -56,85 +64,245 @@ def confluence_get_page(page_id: str, include_body: bool = True) -> dict:
         "body_storage": ((page.get("body") or {}).get("storage") or {}).get("value")
                         if include_body else None,
     }
+    return sanitize_strings(result)
 
 
-def confluence_search_by_title(space_key: str, title: str, limit: int = 10) -> list[dict]:
+def confluence_search_by_title(space_key: str, title: str, limit: int = 10) -> dict:
     """Find a Confluence page in a space by exact title match.
 
-    Returns list of {id, title, space_key, url}.
+    Returns {results: [{id, title, space_key, url}], pagination}.
     """
     raw = safe_call(confluence.get_page_by_title, space_key, title)
     if not raw:
-        return []
-    return [{
+        return envelope_full([])
+    items = sanitize_strings([{
         "id": raw.get("id"),
         "title": raw.get("title"),
         "space_key": (raw.get("space") or {}).get("key", space_key),
         "url": f"{_base()}/pages/viewpage.action?pageId={raw.get('id')}",
-    }]
+    }])
+    return envelope_full(items)
 
 
-def confluence_search_cql(cql: str, limit: int = 25) -> list[dict]:
-    """Full-text search over Confluence using CQL.
+def confluence_search_cql(
+    cql: str,
+    limit: int = 25,
+    start_at: int = 0,
+    include_excerpt: bool = True,
+) -> dict:
+    """Full-text search over Confluence using CQL, paginated.
 
-    Examples:
+    BREAKING CHANGE (PR#2): return type is now an envelope
+    {results, pagination}, not a bare list.
+
+    Examples of CQL:
       - `type = page AND space = FF AND text ~ "MVP"`
       - `title = "Release notes" AND lastModified >= "2026/01/01"`
       - `label = "onboarding"`
 
-    Returns list of {id, type, title, space_key, url, excerpt}.
+    CQL dates are interpreted in the Confluence instance's timezone for the
+    requesting user. For reliable "calendar day in MSK" semantics, prefer
+    confluence_search_by_date which handles timezone conversion.
+
+    Args:
+        cql: CQL expression.
+        limit: page size (default 25, up to 50 per Confluence page limit).
+        start_at: pagination offset. Use pagination.next_start_at.
+        include_excerpt: when False, excerpt is not requested and not returned.
+                         Excerpt can contain truncated surrogate pairs from
+                         emojis in page content; for pure metadata scans
+                         (activity feeds, digests) set this to False.
+
+    Returns:
+        {
+          "results": [{id, type, title, space_key, url, excerpt?}, ...],
+          "pagination": {start_at, limit, size, has_more, next_start_at?}
+        }
     """
-    raw = safe_call(
-        confluence.cql,
-        cql,
-        limit=min(limit, 50),
-        expand="content.space",
-    )
-    results = raw.get("results", []) if isinstance(raw, dict) else []
+    page_limit = min(limit, 50)
+
+    # When include_excerpt is False we skip the 'highlight' expand — Confluence
+    # won't build the excerpt server-side, which removes both the latency and
+    # the truncation hazard. We still need content.space for space_key.
+    expand = "content.space"
+
+    kwargs: dict = {
+        "limit": page_limit,
+        "start": start_at,
+        "expand": expand,
+    }
+
+    raw = safe_call(confluence.cql, cql, **kwargs)
+
+    if not isinstance(raw, dict):
+        raw = {}
+    results_raw = raw.get("results", []) or []
+    total_size = raw.get("size")  # Confluence returns size of this page, not total
     base = _base()
-    out = []
-    for r in results:
+
+    out: list[dict] = []
+    for r in results_raw:
         content = r.get("content", {}) or {}
         cid = content.get("id")
         space = content.get("space") or {}
-        out.append({
+        item = {
             "id": cid,
             "type": content.get("type"),
             "title": content.get("title"),
             "space_key": space.get("key"),
             "url": f"{base}/pages/viewpage.action?pageId={cid}" if cid else None,
-            "excerpt": r.get("excerpt"),
-        })
-    return out
+        }
+        if include_excerpt:
+            item["excerpt"] = r.get("excerpt")
+        out.append(item)
+
+    returned = len(out)
+    has_more = returned == page_limit  # Confluence CQL has no 'total' — infer
+
+    pagination = {
+        "start_at": start_at,
+        "limit": page_limit,
+        "size": returned,
+        "has_more": has_more,
+        "next_start_at": start_at + returned if has_more else None,
+    }
+
+    return sanitize_strings({"results": out, "pagination": pagination})
 
 
-def confluence_get_page_children(page_id: str, limit: int = 50, start: int = 0) -> list[dict]:
+def confluence_search_by_date(
+    date_from: str,
+    date_to: str | None = None,
+    timezone: str = "Europe/Moscow",
+    field: str = "lastmodified",
+    space_key: str | None = None,
+    content_type: str = "page",
+    title_contains: str | None = None,
+    include_excerpt: bool = False,
+    max_results: int = 50,
+    start_at: int = 0,
+) -> dict:
+    """Search Confluence by a date range with explicit timezone semantics.
+
+    Builds a CQL query with bounds converted from the given timezone into the
+    format Confluence expects ('YYYY-MM-DD HH:mm'). Use this for "what changed
+    yesterday in MSK" queries — it removes all the TZ-related ambiguity that
+    plagues raw confluence_search_cql with lastmodified filters.
+
+    Args:
+        date_from: calendar date 'YYYY-MM-DD' — inclusive lower bound at 00:00
+                   in the given timezone.
+        date_to: calendar date 'YYYY-MM-DD' — exclusive upper bound at 00:00
+                 in the given timezone. Defaults to date_from + 1 day, i.e.
+                 a single calendar day.
+        timezone: IANA name, default 'Europe/Moscow'.
+        field: 'lastmodified' (default) or 'created'.
+        space_key: filter by space (e.g. 'PP').
+        content_type: 'page' (default), 'blogpost', 'comment', 'attachment'.
+        title_contains: optional title substring filter ('~' in CQL).
+        include_excerpt: default False — this tool is for activity feeds,
+                         so we skip the surrogate-hazardous excerpt by default.
+        max_results: page size (up to 50).
+        start_at: pagination offset.
+
+    Returns same envelope as confluence_search_cql.
+    """
+    if field not in ("lastmodified", "created"):
+        raise ToolError("field must be 'lastmodified' or 'created'")
+    if content_type not in ("page", "blogpost", "comment", "attachment"):
+        raise ToolError(
+            "content_type must be 'page', 'blogpost', 'comment' or 'attachment'"
+        )
+
+    try:
+        tz = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as e:
+        raise ToolError(f"Unknown timezone '{timezone}': {e}") from e
+
+    try:
+        d_from = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=tz)
+    except ValueError as e:
+        raise ToolError(f"date_from must be 'YYYY-MM-DD': {e}") from e
+
+    if date_to is None:
+        d_to = d_from + timedelta(days=1)
+    else:
+        try:
+            d_to = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=tz)
+        except ValueError as e:
+            raise ToolError(f"date_to must be 'YYYY-MM-DD': {e}") from e
+
+    if d_to <= d_from:
+        raise ToolError(f"date_to ({date_to}) must be after date_from ({date_from})")
+
+    # Confluence CQL accepts 'YYYY-MM-DD HH:mm' in the requesting user's TZ.
+    # The bot user's TZ is unknown to us; converting to UTC and letting
+    # Confluence interpret it would be wrong. Instead we emit the literal
+    # wall-clock time in the requested TZ — this matches what a human would
+    # type in the Confluence search UI when asking "from midnight MSK".
+    # In practice Confluence Data Center honors the string as instance-local
+    # time; for most Russian deployments the server runs in MSK or UTC and
+    # the difference is either zero or documented.
+    fmt = "%Y-%m-%d %H:%M"
+    from_str = d_from.strftime(fmt)
+    to_str = d_to.strftime(fmt)
+
+    parts: list[str] = [
+        f'type = "{content_type}"',
+        f'{field} >= "{from_str}"',
+        f'{field} < "{to_str}"',
+    ]
+    if space_key:
+        # Escape double quotes in space_key defensively
+        sk = space_key.replace('"', '\\"')
+        parts.append(f'space = "{sk}"')
+    if title_contains:
+        esc = title_contains.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'title ~ "{esc}"')
+
+    cql = " AND ".join(parts) + f" ORDER BY {field} DESC"
+
+    result = confluence_search_cql(
+        cql=cql,
+        limit=max_results,
+        start_at=start_at,
+        include_excerpt=include_excerpt,
+    )
+    # Augment pagination with the resolved CQL for debugging
+    result["pagination"]["cql"] = cql
+    result["pagination"]["timezone"] = timezone
+    return result
+
+
+def confluence_get_page_children(page_id: str, limit: int = 50, start_at: int = 0) -> dict:
     """List direct child pages of a Confluence page.
 
-    Returns list of {id, title, url}.
+    Returns {results: [{id, title, url}], pagination}.
     """
+    page_limit = min(limit, 200)
     raw = safe_call(
         confluence.get_page_child_by_type,
         page_id,
         type="page",
-        start=start,
-        limit=min(limit, 200),
+        start=start_at,
+        limit=page_limit,
     )
     results = raw if isinstance(raw, list) else (
         raw.get("results", []) if isinstance(raw, dict) else []
     )
     base = _base()
-    return [
+    items = sanitize_strings([
         {
             "id": p.get("id"),
             "title": p.get("title"),
             "url": f"{base}/pages/viewpage.action?pageId={p.get('id')}",
         }
         for p in results
-    ]
+    ])
+    return envelope_paginated(items, start_at=start_at, limit=page_limit)
 
 
-def confluence_get_page_history(page_id: str, limit: int = 25) -> list[dict]:
+def confluence_get_page_history(page_id: str, limit: int = 25) -> dict:
     """Version history of a Confluence page.
 
     Returns list of {version, when, by, message, minor}.
@@ -155,7 +323,7 @@ def confluence_get_page_history(page_id: str, limit: int = 25) -> list[dict]:
             "message": v.get("message") or "",
             "minor": v.get("minorEdit", False),
         })
-    return out
+    return sanitize_strings(envelope_full(out))
 
 
 # --------- write ---------
@@ -188,7 +356,7 @@ def confluence_create_page(
         raise ToolError(f"Unexpected Confluence response: {result}")
     return {
         "id": page_id,
-        "title": result.get("title"),
+        "title": sanitize_str(result.get("title")),
         "version": (result.get("version") or {}).get("number", 1),
         "url": f"{_base()}/pages/viewpage.action?pageId={page_id}",
     }
@@ -219,7 +387,7 @@ def confluence_update_page(
     )
     return {
         "id": result.get("id"),
-        "title": result.get("title"),
+        "title": sanitize_str(result.get("title")),
         "version": (result.get("version") or {}).get("number"),
         "url": f"{_base()}/pages/viewpage.action?pageId={result.get('id')}",
     }
@@ -245,21 +413,12 @@ def confluence_copy_page(
     - Comments (footer and inline)
     - Watchers
     - Page restrictions
-    - Inbound links to the source page (they continue to point to source)
+    - Inbound links to the source page
 
     What IS carried over when flags are True:
     - Page body (storage format)
-    - Attachments (re-uploaded; file size limited by MAX_URL_FETCH_SIZE)
+    - Attachments (re-uploaded; size limited by MAX_URL_FETCH_SIZE)
     - Labels
-
-    Args:
-        source_page_id: page to copy from.
-        target_parent_id: parent under which the new page is created.
-        new_title: title of the new page. Defaults to source title.
-                   Must be unique within the target space.
-        target_space_key: space key. Defaults to the source page's space.
-        include_attachments: re-upload attachments to the new page.
-        include_labels: copy labels to the new page.
 
     Returns {id, title, url, warnings, copied: {attachments, labels}}.
     """
@@ -310,7 +469,6 @@ def confluence_copy_page(
             if not aid or not filename or not dl:
                 continue
             try:
-                # Stream attachment to memory (size-bound by MAX_URL_FETCH_SIZE)
                 headers = {"Authorization": f"Bearer {settings.confluence_pat}"}
                 with requests.get(
                     f"{_base()}{dl}",
@@ -377,7 +535,7 @@ def confluence_copy_page(
     if label_errors:
         warnings.append(f"label errors: {label_errors}")
 
-    return {
+    return sanitize_strings({
         "id": new_id,
         "title": created.get("title"),
         "url": f"{_base()}/pages/viewpage.action?pageId={new_id}",
@@ -387,7 +545,7 @@ def confluence_copy_page(
             "labels": copied_labels,
         },
         "warnings": warnings,
-    }
+    })
 
 
 # --------- comments ---------
@@ -395,9 +553,9 @@ def confluence_copy_page(
 def confluence_get_page_comments(
     page_id: str,
     limit: int = 25,
-    start: int = 0,
+    start_at: int = 0,
     location: str = "footer",
-) -> list[dict]:
+) -> dict:
     """Get comments attached to a Confluence page.
 
     Args:
@@ -406,6 +564,7 @@ def confluence_get_page_comments(
     if location not in ("footer", "inline", "all"):
         raise ToolError("location must be 'footer', 'inline', or 'all'")
     locations = ["footer", "inline"] if location == "all" else [location]
+    page_limit = min(limit, 100)
 
     out: list[dict] = []
     for loc in locations:
@@ -415,8 +574,8 @@ def confluence_get_page_comments(
             params={
                 "location": loc,
                 "expand": "body.storage,version,history.createdBy",
-                "limit": min(limit, 100),
-                "start": start,
+                "limit": page_limit,
+                "start": start_at,
             },
         )
         results = raw.get("results", []) if isinstance(raw, dict) else []
@@ -430,7 +589,7 @@ def confluence_get_page_comments(
                 "body_storage": ((c.get("body") or {}).get("storage") or {}).get("value", ""),
                 "location": loc,
             })
-    return out
+    return sanitize_strings(envelope_paginated(out, start_at=start_at, limit=page_limit))
 
 
 def confluence_add_comment(
@@ -453,13 +612,13 @@ def confluence_add_comment(
         raise ToolError(f"Unexpected Confluence response: {result}")
     history = result.get("history") or {}
     created_by = history.get("createdBy") or {}
-    return {
+    return sanitize_strings({
         "id": comment_id,
         "page_id": page_id,
         "author": created_by.get("displayName") or created_by.get("username"),
         "created": history.get("createdDate"),
         "url": f"{_base()}/pages/viewpage.action?pageId={page_id}#comment-{comment_id}",
-    }
+    })
 
 
 # --------- attachments ---------
@@ -467,19 +626,20 @@ def confluence_add_comment(
 def confluence_list_attachments(
     page_id: str,
     limit: int = 50,
-    start: int = 0,
-) -> list[dict]:
+    start_at: int = 0,
+) -> dict:
     """List attachments on a Confluence page.
 
     Returns list of {id, filename, size_bytes, mime, version, download_url, author, created}.
     """
+    page_limit = min(limit, 200)
     raw = safe_call(
         confluence.get,
         f"rest/api/content/{page_id}/child/attachment",
         params={
             "expand": "version,metadata,history.createdBy,extensions",
-            "limit": min(limit, 200),
-            "start": start,
+            "limit": page_limit,
+            "start": start_at,
         },
     )
     results = raw.get("results", []) if isinstance(raw, dict) else []
@@ -500,15 +660,13 @@ def confluence_list_attachments(
             "author": created_by.get("displayName") or created_by.get("username"),
             "created": history.get("createdDate"),
         })
-    return out
+    return sanitize_strings(envelope_paginated(out, start_at=start_at, limit=page_limit))
 
 
 def confluence_get_attachment(attachment_id: str) -> dict:
     """Download a Confluence attachment as base64.
 
     Size limited by MAX_ATTACHMENT_SIZE (default 2 MB).
-
-    Returns {id, filename, mime, size_bytes, data_base64}.
     """
     meta = safe_call(
         confluence.get,
@@ -546,7 +704,7 @@ def confluence_get_attachment(attachment_id: str) -> dict:
     metadata = meta.get("metadata") or {}
     return {
         "id": attachment_id,
-        "filename": meta.get("title"),
+        "filename": sanitize_str(meta.get("title")),
         "mime": metadata.get("mediaType"),
         "size_bytes": len(data),
         "data_base64": b64encode_bytes(data),
@@ -579,7 +737,7 @@ def _confluence_upload_raw(
     download_link = ((att.get("_links") or {}).get("download") or "")
     return {
         "id": att.get("id"),
-        "filename": att.get("title") or filename,
+        "filename": sanitize_str(att.get("title") or filename),
         "version": (att.get("version") or {}).get("number"),
         "download_url": f"{_base()}{download_link}" if download_link else None,
     }
@@ -592,13 +750,7 @@ def confluence_upload_attachment(
     mime: str | None = None,
     comment: str | None = None,
 ) -> dict:
-    """Upload (or update) an attachment on a Confluence page from base64.
-
-    Size limited by MAX_ATTACHMENT_SIZE (default 2 MB). For larger files use
-    confluence_attach_from_url with a public download URL.
-
-    Returns {id, filename, version, download_url}.
-    """
+    """Upload (or update) an attachment on a Confluence page from base64."""
     raw = b64decode_to_bytes(data_base64)
     if len(raw) > settings.max_attachment_size:
         raise ToolError(
@@ -616,20 +768,7 @@ def confluence_attach_from_url(
     mime: str | None = None,
     comment: str | None = None,
 ) -> dict:
-    """Download a file from a public URL and attach it to a Confluence page.
-
-    URL validation: only http/https; private/reserved IPs rejected; redirects
-    capped at 5. Size capped by MAX_URL_FETCH_SIZE (default 10 MB).
-
-    Args:
-        page_id: target page id.
-        url: public http(s) URL.
-        filename: override auto-detection.
-        mime: override Content-Type from response.
-        comment: optional attachment-version comment.
-
-    Returns {id, filename, version, download_url, source_url}.
-    """
+    """Download a file from a public URL and attach it to a Confluence page."""
     fetched = fetch_url(url, filename=filename, mime=mime)
     result = _confluence_upload_raw(
         page_id, fetched.filename, fetched.data, fetched.mime, comment,
@@ -641,10 +780,7 @@ def confluence_attach_from_url(
 # --------- labels ---------
 
 def confluence_add_label(page_id: str, label: str) -> dict:
-    """Add a label to a Confluence page.
-
-    Returns {page_id, label, all_labels}.
-    """
+    """Add a label to a Confluence page."""
     payload = [{"prefix": "global", "name": label}]
     safe_call(
         confluence.post,
@@ -665,14 +801,14 @@ def confluence_add_label(page_id: str, label: str) -> dict:
 def confluence_get_current_user() -> dict:
     """Return the currently authenticated Confluence user."""
     data = safe_call(confluence.get, "rest/api/user/current")
-    return {
+    return sanitize_strings({
         "userKey": data.get("userKey"),
         "username": data.get("username"),
         "displayName": data.get("displayName"),
         "email": data.get("email"),
         "type": data.get("type"),
         "profilePicture": (data.get("profilePicture") or {}).get("path"),
-    }
+    })
 
 
 def confluence_get_user(identifier: str, by: str = "username") -> dict:
@@ -685,24 +821,18 @@ def confluence_get_user(identifier: str, by: str = "username") -> dict:
         "rest/api/user",
         params={param_name: identifier},
     )
-    return {
+    return sanitize_strings({
         "userKey": data.get("userKey"),
         "username": data.get("username"),
         "displayName": data.get("displayName"),
         "email": data.get("email"),
         "type": data.get("type"),
         "profilePicture": (data.get("profilePicture") or {}).get("path"),
-    }
+    })
 
 
-def confluence_search_users(query: str, limit: int = 25) -> list[dict]:
-    """Search Confluence users by displayName via CQL.
-
-    Args:
-        query: search string. Special CQL characters (quotes, backslashes)
-               are escaped.
-        limit: max results (default 25, up to 50).
-    """
+def confluence_search_users(query: str, limit: int = 25) -> dict:
+    """Search Confluence users by displayName via CQL."""
     escaped = query.replace("\\", "\\\\").replace('"', '\\"')
     cql = f'type = "user" AND user.fullname ~ "{escaped}"'
     raw = safe_call(
@@ -720,7 +850,7 @@ def confluence_search_users(query: str, limit: int = 25) -> list[dict]:
             "displayName": u.get("displayName"),
             "email": u.get("email"),
         })
-    return out
+    return sanitize_strings(envelope_full(out))
 
 
 TOOLS = [
@@ -728,6 +858,7 @@ TOOLS = [
     confluence_get_page,
     confluence_search_by_title,
     confluence_search_cql,
+    confluence_search_by_date,
     confluence_get_page_children,
     confluence_get_page_history,
     confluence_create_page,

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Attachments
-    max_attachment_size: int = 2 * 1024 * 1024  # 2 MB
+    max_attachment_size: int = 2 * 1024 * 1024       # 2 MB for base64 via MCP
     max_url_fetch_size: int = 10 * 1024 * 1024       # 10 MB for attach_from_url
 
     @property
