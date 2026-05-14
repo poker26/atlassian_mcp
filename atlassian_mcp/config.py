@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     max_attachment_size: int = 2 * 1024 * 1024  # 2 MB
     max_url_fetch_size: int = 10 * 1024 * 1024       # 10 MB for attach_from_url
 
+    # confluence_replace_in_page_storage safety limits
+    replace_max_rules: int = 40
+    replace_max_find_length: int = 64 * 1024
+    replace_max_replace_length: int = 256 * 1024
+    replace_max_combined_find_replace_bytes: int = 512 * 1024
+    replace_max_literal_occurrences_per_rule: int = 10_000
+    replace_max_regex_occurrences_per_rule: int = 500
+    replace_regex_timeout_seconds: float = 2.0
+
     @property
     def verify(self) -> bool | str:
         """Turn SSL_VERIFY into what requests/atlassian-python-api expects."""

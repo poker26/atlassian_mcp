@@ -3,6 +3,7 @@ from atlassian_mcp.tools.confluence import TOOLS as CONFLUENCE_TOOLS
 from atlassian_mcp.tools.confluence_lifecycle import TOOLS as CONFLUENCE_LIFECYCLE_TOOLS
 from atlassian_mcp.tools.confluence_macros import TOOLS as CONFLUENCE_MACROS_TOOLS
 from atlassian_mcp.tools.confluence_restrictions import TOOLS as CONFLUENCE_RESTRICTIONS_TOOLS
+from atlassian_mcp.tools.confluence_storage_replace import TOOLS as CONFLUENCE_STORAGE_REPLACE_TOOLS
 from atlassian_mcp.tools.confluence_templates import TOOLS as CONFLUENCE_TEMPLATES_TOOLS
 from atlassian_mcp.tools.jira import TOOLS as JIRA_TOOLS
 from atlassian_mcp.tools.jira_boards import TOOLS as JIRA_BOARDS_TOOLS
@@ -19,4 +20,5 @@ ALL_TOOLS = (
     + CONFLUENCE_RESTRICTIONS_TOOLS
     + CONFLUENCE_LIFECYCLE_TOOLS
     + CONFLUENCE_MACROS_TOOLS
+    + CONFLUENCE_STORAGE_REPLACE_TOOLS
 )

@@ -14,7 +14,8 @@ mcp = FastMCP(
         "Atlassian MCP server exposing Jira and Confluence Data Center. "
         "Jira tools wrap REST API v2 via atlassian-python-api. "
         "Confluence tools wrap REST API v1 via atlassian-python-api. "
-        "Most Confluence write tools accept content_format='storage'|'wiki'|'plain'|'markdown'."
+        "Most Confluence write tools accept content_format='storage'|'wiki'|'plain'|'markdown'. "
+        "For large pages, prefer confluence_replace_in_page_storage over sending full body.storage."
     ),
 )
 

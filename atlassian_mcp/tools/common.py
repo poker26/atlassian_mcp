@@ -15,6 +15,20 @@ class ToolError(Exception):
     """Raised when a tool call fails in a user-visible way."""
 
 
+class StructuredToolError(ToolError):
+    """Tool failure with a stable machine-readable ``code`` for agents and logs."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.code = code
+        self.details: dict[str, Any] = details if details is not None else {}
+        super().__init__(f"{code}: {message}")
+
+
 def safe_call(fn: Callable[..., Any], *args, **kwargs) -> Any:
     """Call a client method and normalize errors into ToolError.
 

@@ -1,6 +1,7 @@
 """Confluence tools (REST API v1 via atlassian-python-api, Confluence 7.19 DC)."""
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,6 +11,7 @@ import requests
 from atlassian_mcp.clients import confluence
 from atlassian_mcp.config import settings
 from atlassian_mcp.tools.common import (
+    StructuredToolError,
     ToolError,
     b64decode_to_bytes,
     b64encode_bytes,
@@ -20,6 +22,7 @@ from atlassian_mcp.tools.common import (
     sanitize_strings,
     to_storage,
 )
+from atlassian_mcp.tools.confluence_storage_replace import put_confluence_content_update
 from atlassian_mcp.tools.url_fetch import fetch_url
 
 
@@ -368,23 +371,109 @@ def confluence_update_page(
     title: str | None = None,
     content_format: str = "storage",
     minor_edit: bool = False,
+    expected_version: int | None = None,
+    content_encoding: str = "plain",
+    version_comment: str | None = None,
 ) -> dict:
-    """Update an existing Confluence page. Version auto-increments."""
-    body_value, representation = to_storage(content, content_format)
-    existing = safe_call(
-        confluence.get_page_by_id,
-        page_id,
-        expand="version,space",
-    )
-    new_title = title or existing.get("title")
-    result = safe_call(
-        confluence.update_page,
-        page_id=page_id,
-        title=new_title,
-        body=body_value,
-        representation=representation,
-        minor_edit=minor_edit,
-    )
+    """Update an existing Confluence page. Version auto-increments on the server.
+
+    For agents editing large ``body.storage`` HTML, prefer
+    ``confluence_replace_in_page_storage`` so the full markup is not sent in the
+    MCP JSON payload.
+
+    Args:
+        content: Page body text (or base64 of UTF-8 text when ``content_encoding``
+            is ``base64``). For ``base64``, decode to UTF-8 before ``content_format``
+            conversion.
+        content_encoding: ``plain`` (default) or ``base64`` for large bodies to
+            reduce JSON escaping issues in some clients.
+        expected_version: When set, the update is applied only if the current
+            Confluence ``version.number`` equals this value (after a fresh GET).
+            On mismatch, raises ``StructuredToolError`` with code ``VERSION_CONFLICT``.
+        version_comment: Optional Confluence version message (library / REST).
+    """
+    encoding = (content_encoding or "plain").lower().strip()
+    if encoding not in ("plain", "base64"):
+        raise ToolError(
+            f"content_encoding must be 'plain' or 'base64' (got {content_encoding!r})."
+        )
+    if encoding == "base64":
+        try:
+            decoded_bytes = b64decode_to_bytes(content.strip())
+        except Exception as decode_error:
+            raise ToolError(f"Invalid base64 in content: {decode_error}") from decode_error
+        try:
+            text_payload = decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError as unicode_error:
+            raise ToolError(
+                "base64-decoded content is not valid UTF-8; expected UTF-8 text "
+                "after decoding."
+            ) from unicode_error
+    else:
+        text_payload = content
+
+    body_value, representation = to_storage(text_payload, content_format)
+
+    if expected_version is not None:
+        existing = safe_call(
+            confluence.get,
+            f"rest/api/content/{page_id}",
+            params={
+                "expand": (
+                    "body.storage,body.wiki,version,space,title,type,"
+                    "metadata.properties"
+                ),
+            },
+        )
+        if not isinstance(existing, dict):
+            raise ToolError(
+                f"Unexpected response fetching page {page_id}: {type(existing).__name__}"
+            )
+        current_version = (existing.get("version") or {}).get("number")
+        if not isinstance(current_version, int):
+            raise ToolError(
+                f"Page {page_id} has no integer version — cannot enforce expected_version."
+            )
+        if current_version != expected_version:
+            raise StructuredToolError(
+                "VERSION_CONFLICT",
+                f"Page version is {current_version} but expected_version was "
+                f"{expected_version}. Re-fetch with confluence_get_page and retry.",
+                {
+                    "page_id": str(page_id),
+                    "current_version": current_version,
+                    "expected_version": expected_version,
+                    "hint": "confluence_get_page(page_id)",
+                },
+            )
+        merged = copy.deepcopy(existing)
+        merged["title"] = title if title is not None else existing.get("title")
+        if not merged.get("title"):
+            raise ToolError(f"Page {page_id} has no title and none was provided.")
+        result = put_confluence_content_update(
+            merged,
+            body_value,
+            representation,
+            minor_edit,
+            version_comment,
+        )
+    else:
+        existing = safe_call(
+            confluence.get_page_by_id,
+            page_id,
+            expand="version,space",
+        )
+        new_title = title if title is not None else existing.get("title")
+        update_kwargs: dict[str, Any] = {
+            "page_id": page_id,
+            "title": new_title,
+            "body": body_value,
+            "representation": representation,
+            "minor_edit": minor_edit,
+        }
+        if version_comment:
+            update_kwargs["version_comment"] = version_comment
+        result = safe_call(confluence.update_page, **update_kwargs)
     return {
         "id": result.get("id"),
         "title": sanitize_str(result.get("title")),
