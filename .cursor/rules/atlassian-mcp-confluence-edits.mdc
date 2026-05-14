@@ -1,0 +1,28 @@
+---
+description: Как вызывать Atlassian MCP для правок Confluence (replace vs update_page)
+alwaysApply: true
+---
+
+# Atlassian MCP — правки Confluence
+
+Это правило для workspace, где подключён **этот** MCP-сервер (`atlassian-mcp`). Цель — чтобы агент стабильно выбирал безопасный контракт вызовов.
+
+## Большие страницы и точечные правки
+
+- **По умолчанию** для изменения текста в `body.storage` используй **`confluence_replace_in_page_storage`**, а не пересылку полного HTML через **`confluence_update_page`**.
+- Рабочий порядок:
+  1. При необходимости **`confluence_get_page`** — зафиксируй `version` и при желании передай его как **`expected_version`** в replace/update.
+  2. Первый вызов replace с **`dry_run: true`** — проверь `total_occurrences_applied`, `replacements[].occurrences_eligible`, `warnings`, при `dry_run` — `snippets`.
+  3. Запись: **`dry_run: false`**. Если гонка версий — сообщение с кодом **`VERSION_CONFLICT`**: снова **`confluence_get_page`**, обнови **`expected_version`**, повтори.
+- **`match: "literal"`** — для плейсхолдеров и точных подстрок; **`regex`** — только при необходимости; учитывай лимиты времени и числа совпадений (см. ответ сервера и `INSTRUCTIONS.md`).
+
+## Полная замена тела
+
+- **`confluence_update_page`** — когда нужно заменить страницу целиком или формат не сводится к точечным заменам.
+- Для очень больших тел: **`content_encoding: "base64"`** (UTF-8 после декодирования), плюс при необходимости **`expected_version`** (иначе **`VERSION_CONFLICT`** при рассинхроне).
+
+## Справка в репозитории
+
+Подробные параметры, коды ошибок и примеры JSON — в **`INSTRUCTIONS.md`** в корне репозитория.
+
+Если корень Cursor — другой проект, скопируй этот файл в **`.cursor/rules/`** того workspace или добавь ссылку на `INSTRUCTIONS.md` в свои правила.

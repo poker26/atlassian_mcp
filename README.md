@@ -9,9 +9,18 @@ Packaging mirrors [gitlab_mcp](https://github.com/poker26/gitlab_mcp): single AS
 - `GET /health` — unauthenticated liveness + Jira/Confluence reachability probe
 - `GET /docs` — Swagger UI for REST side
 
-## Tools (21)
+## Документация для AI-агента (Cursor)
 
-### Jira (6)
+- **`INSTRUCTIONS.md`** — параметры, коды ошибок, примеры вызовов для **`confluence_replace_in_page_storage`** и расширений **`confluence_update_page`**.
+- **`.cursor/rules/atlassian-mcp-confluence-edits.mdc`** — правило проекта с `alwaysApply: true`: краткий рабочий процесс (dry_run → запись, replace vs full update).
+
+Если MCP подключён к **другому** корневому workspace, скопируй этот `.mdc` в его `.cursor/rules/` или добавь ссылку на `INSTRUCTIONS.md`.
+
+## Tools
+
+Зарегистрировано **70+** MCP-инструментов (Jira, Confluence, фильтры, доски, шаблоны и др.). Ниже — устаревший краткий список; актуальный набор см. в `atlassian_mcp/tools/__init__.py` (`ALL_TOOLS`).
+
+### Jira (примеры)
 | Tool | Purpose |
 |------|---------|
 | `jira_search` | JQL search, returns key/summary/status/assignee/priority |
@@ -21,17 +30,18 @@ Packaging mirrors [gitlab_mcp](https://github.com/poker26/gitlab_mcp): single AS
 | `jira_add_comment` | Add a comment to an issue |
 | `jira_transition_issue` | Change issue status; pass unknown transition to list available |
 
-### Confluence (15)
+### Confluence (примеры)
 | Tool | Purpose |
 |------|---------|
 | `confluence_list_spaces` | List accessible spaces (paginated) |
 | `confluence_get_page` | Page by id with body in storage format |
+| `confluence_replace_in_page_storage` | **Предпочтительно для агентов:** точечные замены в `body.storage` на сервере (GET → replace → validate → PUT); поддержка `dry_run`, `expected_version` |
 | `confluence_search_by_title` | Exact-title lookup within a space |
 | `confluence_search_cql` | Full-text CQL search |
 | `confluence_get_page_children` | Direct child pages |
 | `confluence_get_page_history` | Version history |
 | `confluence_create_page` | Create page (storage/wiki/plain/markdown input) |
-| `confluence_update_page` | Update page content/title with auto version bump |
+| `confluence_update_page` | Полная замена контента; опции `expected_version`, `content_encoding=base64`, `version_comment` |
 | `confluence_move_page` | ⚠️ Not supported on 7.19 — returns a clear error |
 | `confluence_get_page_comments` | List footer/inline comments |
 | `confluence_add_comment` | Add a footer comment |

@@ -11,11 +11,22 @@ log = logging.getLogger(__name__)
 mcp = FastMCP(
     name="atlassian-mcp",
     instructions=(
-        "Atlassian MCP server exposing Jira and Confluence Data Center. "
-        "Jira tools wrap REST API v2 via atlassian-python-api. "
-        "Confluence tools wrap REST API v1 via atlassian-python-api. "
-        "Most Confluence write tools accept content_format='storage'|'wiki'|'plain'|'markdown'. "
-        "For large pages, prefer confluence_replace_in_page_storage over sending full body.storage."
+        "Atlassian Data Center MCP: Jira (REST v2) + Confluence (REST v1) via atlassian-python-api. "
+        "Confluence write tools accept content_format='storage'|'wiki'|'plain'|'markdown' unless noted.\n\n"
+        "EDITING CONFLUENCE PAGE BODY (agents): Prefer confluence_replace_in_page_storage over "
+        "confluence_update_page when changing existing storage HTML. The server GETs the page, "
+        "applies ordered replacements[{find, replace, match: literal|regex, max_occurrences?}], "
+        "validates HTML, then PUTs with the next version. Workflow: (1) confluence_get_page for "
+        "page_id and version if you need expected_version; (2) confluence_replace_in_page_storage "
+        "with dry_run=true and inspect total_occurrences_applied and per-rule occurrences; "
+        "(3) repeat with dry_run=false to write. On VERSION_CONFLICT, refresh version from "
+        "confluence_get_page and retry. status no_op means no PUT (idempotent). "
+        "Use fail_if_no_match=true only when zero matches must be an error.\n\n"
+        "confluence_update_page: full body replace; optional expected_version (optimistic lock, "
+        "StructuredToolError VERSION_CONFLICT on mismatch); optional content_encoding=base64 "
+        "for large UTF-8 payloads after base64 decode; optional version_comment.\n\n"
+        "Repository INSTRUCTIONS.md and .cursor/rules/atlassian-mcp-confluence-edits.mdc expand "
+        "this guidance for Cursor."
     ),
 )
 

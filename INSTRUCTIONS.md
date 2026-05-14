@@ -1,5 +1,14 @@
 # Инструкции для агента: Confluence через Atlassian MCP
 
+## Рабочий процесс (кратко)
+
+1. Для **точечных** правок `body.storage` на больших страницах — только **`confluence_replace_in_page_storage`**, не полный HTML в **`confluence_update_page`**.
+2. Сначала **`dry_run: true`**, проверь `total_occurrences_applied`, `replacements[]`, `warnings` (и `snippets` при необходимости).
+3. Затем **`dry_run: false`**. При **`VERSION_CONFLICT`** — снова **`confluence_get_page`**, обнови **`expected_version`**, повтори.
+4. В этом репозитории для Cursor дополнительно включено правило **`.cursor/rules/atlassian-mcp-confluence-edits.mdc`** (`alwaysApply: true` при открытии этого workspace).
+
+Если корень Cursor — **другой** проект (MCP только подключён в настройках), скопируй содержимое этого правила в свой `.cursor/rules/` или добавь ссылку на этот файл в свои правила.
+
 ## Частичные правки страниц (рекомендуется)
 
 Для больших страниц **не передавайте** полный `body.storage` в `confluence_update_page`. Используйте **`confluence_replace_in_page_storage`**: сервер сам читает актуальную версию, применяет замены, валидирует HTML и выполняет `PUT` с корректным `version.number`.

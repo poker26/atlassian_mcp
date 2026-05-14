@@ -334,15 +334,31 @@ def confluence_replace_in_page_storage(
     include_match_snippets: bool = True,
     snippet_radius: int = 48,
 ) -> dict[str, Any]:
-    """Read body.storage from Confluence, apply find/replace rules, validate, then PUT.
+    """Server-side partial edits to Confluence ``body.storage`` (read → replace → validate → PUT).
 
-    This is the preferred way for agents to edit large pages: the full storage
-    HTML never travels through the MCP request beyond the affected spans.
+    **When to use (agents):** Any time you would otherwise paste a large storage HTML blob into
+    ``confluence_update_page``. This tool keeps the MCP JSON small: only short ``find``/``replace``
+    strings cross the wire; the server fetches the current page, applies rules in order, runs a
+    best-effort HTML validation (``lxml``), and PUTs with ``version = current + 1``.
 
-    Each rule object supports:
-      - ``find`` (string), ``replace`` (string)
-      - ``match``: ``literal`` (default) or ``regex`` (``re`` syntax; subject to timeout)
-      - ``max_occurrences`` (optional positive int) — cap per rule
+    **Recommended workflow:** (1) ``confluence_get_page`` if you need ``version`` for
+    ``expected_version`` or to confirm ``page_id``. (2) Call with ``dry_run=true``; verify
+    ``total_occurrences_applied`` and each rule's ``occurrences_eligible`` / ``occurrences_applied``.
+    (3) Call with ``dry_run=false`` to persist. If you see ``VERSION_CONFLICT``, refresh version
+    from ``confluence_get_page`` and retry.
+
+    **Rule object:** ``{"find": str, "replace": str, "match": "literal"|"regex", "max_occurrences"?: int}``.
+    Rules run **in order** on the text produced by the previous rule. Use ``literal`` for
+    placeholders (e.g. Jira keys); use ``regex`` sparingly (server timeout applies).
+
+    **Response ``status``:** ``ok`` (replacements applied and every rule had at least one match
+    when others ran), ``partial`` (some rules had zero matches while others changed text),
+    ``no_op`` (no net change to storage or zero matches — **no PUT** for idempotency).
+
+    **Structured errors (message prefix ``CODE:``):** ``VERSION_CONFLICT`` (stale ``expected_version``
+    or HTTP 409 on PUT), ``NO_MATCH`` when ``fail_if_no_match`` and nothing matched,
+    ``INVALID_STORAGE_AFTER_PATCH`` if HTML validation fails, ``REGEX_TIMEOUT`` if a regex step
+    exceeds the configured wall time.
 
     Args:
         page_id: Confluence page content id.

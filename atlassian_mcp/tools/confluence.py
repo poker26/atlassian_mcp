@@ -375,11 +375,20 @@ def confluence_update_page(
     content_encoding: str = "plain",
     version_comment: str | None = None,
 ) -> dict:
-    """Update an existing Confluence page. Version auto-increments on the server.
+    """Replace the entire Confluence page body (and optional title).
 
-    For agents editing large ``body.storage`` HTML, prefer
-    ``confluence_replace_in_page_storage`` so the full markup is not sent in the
-    MCP JSON payload.
+    **Agents — large pages:** Prefer ``confluence_replace_in_page_storage`` for small,
+    repeatable edits to ``body.storage`` so you do not ship full storage HTML in the MCP payload.
+
+    **When this tool is right:** Full rewrites, switching ``content_format`` (e.g. markdown →
+    storage), or operations that cannot be expressed as ordered find/replace rules.
+
+    **Version safety:** If you pass ``expected_version`` (from ``confluence_get_page``), the
+    server GETs the page first and raises ``StructuredToolError`` code ``VERSION_CONFLICT`` when
+    the live ``version.number`` differs — refresh ``version`` and retry.
+
+    **Large payloads:** ``content_encoding='base64'`` expects standard Base64 of **UTF-8** text
+    (after decode, the same ``content_format`` rules as plain text apply).
 
     Args:
         content: Page body text (or base64 of UTF-8 text when ``content_encoding``
